@@ -30,3 +30,9 @@ async def learning_count() -> dict:
 async def learning(limit: int = 50) -> dict:
     repo = await get_repo()
     return {"entries": await repo.find("learning_log", limit=limit)}
+
+
+@router.get("/artifacts")
+async def artifacts(limit: int = 30) -> dict:
+    repo = await get_repo()
+    return {"artifacts": await repo.find("artifacts", limit=limit)}

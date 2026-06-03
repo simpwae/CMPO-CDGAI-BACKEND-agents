@@ -17,6 +17,7 @@ _ROUTING = {
     "decision": "decisions",
     "appraisal": "appraisals",
     "learning": "learning_log",
+    "artifact": "artifacts",
 }
 
 

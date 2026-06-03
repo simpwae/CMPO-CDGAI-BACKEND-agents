@@ -13,6 +13,7 @@ COLLECTIONS = (
     "appraisals",    # Hamza's per-agent appraisals
     "learning_log",  # human-Maryam decisions recorded for learning
     "config",        # persisted runtime config (e.g. Maryam mode)
+    "artifacts",     # code files produced by the developer agents
 )
 
 

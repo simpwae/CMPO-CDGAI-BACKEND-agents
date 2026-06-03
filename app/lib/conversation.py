@@ -84,8 +84,22 @@ async def _post(sender: str, text: str, *, to: str | None = None,
     return doc
 
 
+# Agents that produce real code when assigned work (and what they build).
+DEV_AGENTS = {
+    "fateh": "frontend",
+    "shams": "backend",
+    "usman": "devops/infra",
+    "ihsan": "tests",
+}
+
+
 async def _reply(agent_id: str, directive: str, *, asker: str) -> None:
-    """A leaf agent does the actual work — real LLM reply posted back to the asker."""
+    """A leaf agent does the work. Developers actually write code (an artifact);
+    everyone else replies in prose."""
+    if agent_id in DEV_AGENTS:
+        await _dev_work(agent_id, directive, asker=asker)
+        return
+
     await get_bus().publish("agent.status", {"agent": agent_id, "status": "working"})
     history = await _history()
     user = (
@@ -99,6 +113,60 @@ async def _reply(agent_id: str, directive: str, *, asker: str) -> None:
     )
     await _post(agent_id, res.text, to=asker,
                 provider=res.provider, fallback_used=res.fallback_used)
+
+
+async def _dev_work(agent_id: str, directive: str, *, asker: str) -> None:
+    """A developer starts coding: the LLM emits real code, captured as an artifact
+    and published so the dashboard's Generated Code panel shows it live."""
+    await get_bus().publish("agent.status", {"agent": agent_id, "status": "working"})
+    area = DEV_AGENTS[agent_id]
+    system = (
+        get_card(agent_id).system_prompt
+        + f"\n\nYou write real, working {area} code. When assigned work, START CODING "
+        "now. Respond with: a one-sentence note on what you built, then EXACTLY one "
+        "fenced code block whose info string is the language and a file path, e.g. "
+        "```python app/main.py. Keep the file focused and runnable (~20-60 lines)."
+    )
+    history = await _history()
+    user = (
+        f"Team conversation so far:\n{_thread_text(history)}\n\n"
+        f"{_name(asker)} assigned you: \"{directive}\"\nWrite the {area} code now."
+    )
+    res = await get_router().generate(
+        agent_id, [LLMMessage(role="user", content=user)],
+        system=system, max_tokens=1100, temperature=0.4,
+    )
+    note, language, filename, code = _extract_code(res.text, agent_id)
+
+    # Conversational summary in the chat...
+    await _post(agent_id, note, to=asker,
+                provider=res.provider, fallback_used=res.fallback_used)
+    # ...and the actual code as a visible artifact.
+    if code:
+        await get_bus().publish("artifact", {
+            "agent": agent_id, "name": _name(agent_id), "area": area,
+            "filename": filename, "language": language, "code": code,
+            "note": note, "provider": res.provider,
+        })
+
+
+def _extract_code(text: str, agent_id: str) -> tuple[str, str, str, str]:
+    """Pull (note, language, filename, code) from an LLM reply with a fenced block."""
+    import re
+
+    m = re.search(r"```([^\n`]*)\n(.*?)```", text, re.DOTALL)
+    if not m:
+        return (text.strip()[:300] or "Working on it.", "text", "", "")
+    info = m.group(1).strip().split()
+    language = info[0] if info else "text"
+    filename = next((tok for tok in info[1:] if "." in tok or "/" in tok), "")
+    if not filename:
+        ext = {"python": "py", "typescript": "ts", "javascript": "js",
+               "tsx": "tsx", "yaml": "yml", "dockerfile": "Dockerfile"}.get(language, "txt")
+        filename = f"{agent_id}_{DEV_AGENTS.get(agent_id, 'file')}.{ext}".replace("/", "_")
+    code = m.group(2).strip()
+    note = text[: m.start()].strip() or f"Implemented {filename}."
+    return note, language, filename, code
 
 
 async def _plan(manager_id: str, directive: str, reports: list[str]) -> dict:
@@ -124,7 +192,7 @@ async def _plan(manager_id: str, directive: str, reports: list[str]) -> dict:
     )
     res = await get_router().generate(
         manager_id, [LLMMessage(role="user", content=user)],
-        system=system, max_tokens=450, temperature=0.3,
+        system=system, max_tokens=700, temperature=0.3,
     )
     parsed = _parse_plan(res.text, reports)
     _ensure_dev_routing(manager_id, directive, parsed, reports)
@@ -134,23 +202,39 @@ async def _plan(manager_id: str, directive: str, reports: list[str]) -> dict:
 
 
 def _parse_plan(text: str, reports: list[str]) -> dict:
+    import re
+
+    cleaned = re.sub(r"```(?:json)?", "", text)
+    # First try strict JSON.
     try:
-        data = json.loads(text[text.index("{"): text.rindex("}") + 1])
+        data = json.loads(cleaned[cleaned.index("{"): cleaned.rindex("}") + 1])
         asks = [
             {"agent": a["agent"], "question": str(a.get("question", "")).strip()
              or "Please handle this."}
             for a in data.get("asks", [])
             if a.get("agent") in reports
         ][:MAX_ASKS]
-        summary = str(data.get("summary", "")).strip() or "On it — delegating now."
-        if not asks:  # fall back to the first report so work still flows
-            asks = [{"agent": reports[0], "question": "Please take this on."}]
-        return {"summary": summary, "asks": asks}
+        summary = str(data.get("summary", "")).strip()
+        if summary and asks:
+            return {"summary": summary, "asks": asks}
+        if summary and not asks:
+            return {"summary": summary,
+                    "asks": [{"agent": reports[0], "question": "Please take this on."}]}
     except Exception:
-        return {
-            "summary": text.strip()[:200] or "On it — delegating now.",
-            "asks": [{"agent": reports[0], "question": "Please take this on."}],
-        }
+        pass
+
+    # Fallback: regex-extract fields (handles truncated/loose JSON without leaking it).
+    summ = re.search(r'"summary"\s*:\s*"([^"]+)"', cleaned)
+    agents = re.findall(r'"agent"\s*:\s*"(\w+)"', cleaned)
+    qs = re.findall(r'"question"\s*:\s*"([^"]+)"', cleaned)
+    asks = [
+        {"agent": a, "question": qs[i] if i < len(qs) else "Please handle this."}
+        for i, a in enumerate(agents) if a in reports
+    ][:MAX_ASKS]
+    if not asks:
+        asks = [{"agent": reports[0], "question": "Please take this on."}]
+    summary = (summ.group(1) if summ else "On it — delegating now.").strip()
+    return {"summary": summary, "asks": asks}
 
 
 _DEV_KW = ("build", "develop", "implement", "api", "backend", "frontend",

@@ -69,3 +69,50 @@ async def test_shams_reply_carries_provider_badge():
     thread = await get_thread()
     shams = [m for m in thread if m["sender"] == "shams"]
     assert shams and shams[-1]["provider"] == "claude"
+
+
+class CodingProvider(LLMProvider):
+    """A developer that emits a real fenced code block."""
+
+    name = "claude"
+
+    async def generate(self, model, messages, *, system=None, **kwargs) -> LLMResult:
+        text = (
+            "Implemented the books endpoint.\n"
+            "```python app/books.py\n"
+            "from fastapi import APIRouter\n"
+            "router = APIRouter()\n"
+            "@router.get('/books')\n"
+            "def list_books():\n"
+            "    return []\n"
+            "```"
+        )
+        return LLMResult(text=text, provider="claude", model=model)
+
+
+@pytest.mark.asyncio
+async def test_developer_emits_visible_code_artifact():
+    import app.lib.db.factory as dbf
+    import app.lib.llm.router as rm
+    from app.lib.events import get_bus
+
+    dbf._repo = MemoryRepository()
+    rm._router = ModelRouter(anthropic=CodingProvider(), gemini=CodingProvider())
+    bus = get_bus()
+    q = bus.subscribe()
+    try:
+        await run_order("@shams Build the books backend API")
+        artifacts = []
+        while not q.empty():
+            ev = q.get_nowait()
+            if ev.type == "artifact":
+                artifacts.append(ev.payload)
+        assert artifacts, "developer should emit a code artifact"
+        art = artifacts[0]
+        assert art["agent"] == "shams"
+        assert art["filename"] == "app/books.py"
+        assert art["language"] == "python"
+        assert "APIRouter" in art["code"]
+    finally:
+        dbf._repo = None
+        rm._router = None
