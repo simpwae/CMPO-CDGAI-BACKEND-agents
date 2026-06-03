@@ -3,9 +3,34 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
+from app.config import get_settings
 from app.lib.db.factory import get_repo
 
 router = APIRouter(prefix="/api", tags=["insights"])
+
+
+@router.get("/llm/status")
+async def llm_status() -> dict:
+    """Safe diagnostic: which provider keys are present (booleans only) + a live
+    test call. Use this to verify env vars on a deployed host."""
+    s = get_settings()
+    keys = {
+        "groq": bool(s.groq_api_key),
+        "claude": bool(s.anthropic_api_key),
+        "gemini": bool(s.gemini_api_key),
+        "grok": bool(s.grok_api_key),
+    }
+    from app.lib.llm.router import get_router
+    from app.lib.llm.types import LLMMessage
+
+    try:
+        r = await get_router().generate(
+            "tariq", [LLMMessage(role="user", content="reply with: ok")], max_tokens=5
+        )
+        live = {"ok": True, "provider": r.provider, "model": r.model}
+    except Exception as e:  # noqa: BLE001
+        live = {"ok": False, "error": str(e)[:400]}
+    return {"keys_configured": keys, "llm_order": s.llm_order, "live_test": live}
 
 
 @router.get("/appraisals")
