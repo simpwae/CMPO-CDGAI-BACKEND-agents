@@ -72,47 +72,60 @@ async def test_shams_reply_carries_provider_badge():
 
 
 class CodingProvider(LLMProvider):
-    """A developer that emits a real fenced code block."""
+    """A developer that emits a real multi-file project."""
 
     name = "claude"
 
     async def generate(self, model, messages, *, system=None, **kwargs) -> LLMResult:
         text = (
-            "Implemented the books endpoint.\n"
-            "```python app/books.py\n"
+            "Built a minimal books API project.\n"
+            "```python backend/app/main.py\n"
+            "from fastapi import FastAPI\n"
+            "from .books import router\n"
+            "app = FastAPI()\n"
+            "app.include_router(router)\n"
+            "```\n"
+            "```python backend/app/books.py\n"
             "from fastapi import APIRouter\n"
             "router = APIRouter()\n"
             "@router.get('/books')\n"
             "def list_books():\n"
             "    return []\n"
+            "```\n"
+            "```text backend/requirements.txt\n"
+            "fastapi\n"
             "```"
         )
         return LLMResult(text=text, provider="claude", model=model)
 
 
 @pytest.mark.asyncio
-async def test_developer_emits_visible_code_artifact():
+async def test_developer_writes_multi_file_project():
     import app.lib.db.factory as dbf
     import app.lib.llm.router as rm
     from app.lib.events import get_bus
+    from app.lib.workspace import list_tree
 
     dbf._repo = MemoryRepository()
     rm._router = ModelRouter(anthropic=CodingProvider(), gemini=CodingProvider())
     bus = get_bus()
     q = bus.subscribe()
     try:
-        await run_order("@shams Build the books backend API")
+        result = await run_order("@shams Build the books backend API")
         artifacts = []
         while not q.empty():
             ev = q.get_nowait()
             if ev.type == "artifact":
                 artifacts.append(ev.payload)
-        assert artifacts, "developer should emit a code artifact"
-        art = artifacts[0]
-        assert art["agent"] == "shams"
-        assert art["filename"] == "app/books.py"
-        assert art["language"] == "python"
-        assert "APIRouter" in art["code"]
+        # A real multi-file project (not a single snippet).
+        paths = {a["filename"] for a in artifacts}
+        assert "backend/app/main.py" in paths
+        assert "backend/app/books.py" in paths
+        assert "backend/requirements.txt" in paths
+        assert all(a.get("project") for a in artifacts)
+        # Files were actually written to disk under the project workspace.
+        tree = list_tree(result["project"])
+        assert "backend/app/books.py" in tree
     finally:
         dbf._repo = None
         rm._router = None

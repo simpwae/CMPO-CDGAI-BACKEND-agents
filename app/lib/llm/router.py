@@ -20,6 +20,7 @@ from app.lib.llm.providers.base import LLMProvider
 from app.lib.llm.providers.gemini_provider import GeminiProvider
 from app.lib.llm.providers.grok_provider import GrokProvider
 from app.lib.llm.providers.groq_provider import GroqProvider
+from app.lib.llm.providers.openrouter_provider import OpenRouterProvider
 from app.lib.llm.types import LLMMessage, LLMResult, ProviderError
 
 # Agents that reason/work on the stronger model tier. Leads orchestrate; the
@@ -42,6 +43,7 @@ class ModelRouter:
         gemini: LLMProvider | None = None,
         grok: LLMProvider | None = None,
         groq: LLMProvider | None = None,
+        openrouter: LLMProvider | None = None,
         observer: CallObserver | None = None,
         order: list[str] | None = None,
     ):
@@ -51,6 +53,7 @@ class ModelRouter:
             "gemini": gemini or GeminiProvider(s.gemini_api_key),
             "grok": grok or GrokProvider(s.grok_api_key),
             "groq": groq or GroqProvider(s.groq_api_key),
+            "openrouter": openrouter or OpenRouterProvider(s.openrouter_api_key),
         }
         self._order = order or DEFAULT_ORDER
         self._observer = observer
@@ -66,6 +69,8 @@ class ModelRouter:
             "gemini": (self._s.gemini_model_lead, self._s.gemini_model_default),
             "grok": (self._s.grok_model_lead, self._s.grok_model_default),
             "groq": (self._s.groq_model_lead, self._s.groq_model_default),
+            "openrouter": (self._s.openrouter_model_lead,
+                           self._s.openrouter_model_default),
         }[provider]
         return models[0] if lead else models[1]
 

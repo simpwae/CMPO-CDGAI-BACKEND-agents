@@ -23,6 +23,7 @@ from app.lib.db.factory import get_repo
 from app.lib.events import get_bus
 from app.lib.llm.router import get_router
 from app.lib.llm.types import LLMMessage
+from app.lib.workspace import new_project, write_file
 
 # Org chart: manager -> direct reports (everyone else is a leaf who does the work).
 HIERARCHY: dict[str, list[str]] = {
@@ -97,11 +98,11 @@ DEV_AGENTS = {
 }
 
 
-async def _reply(agent_id: str, directive: str, *, asker: str) -> None:
-    """A leaf agent does the work. Developers actually write code (an artifact);
-    everyone else replies in prose."""
+async def _reply(agent_id: str, directive: str, *, asker: str, project: str) -> None:
+    """A leaf agent does the work. Developers actually write a multi-file project
+    to disk; everyone else replies in prose."""
     if agent_id in DEV_AGENTS:
-        await _dev_work(agent_id, directive, asker=asker)
+        await _dev_work(agent_id, directive, asker=asker, project=project)
         return
 
     await get_bus().publish("agent.status", {"agent": agent_id, "status": "working"})
@@ -119,58 +120,72 @@ async def _reply(agent_id: str, directive: str, *, asker: str) -> None:
                 provider=res.provider, fallback_used=res.fallback_used)
 
 
-async def _dev_work(agent_id: str, directive: str, *, asker: str) -> None:
-    """A developer starts coding: the LLM emits real code, captured as an artifact
-    and published so the dashboard's Generated Code panel shows it live."""
+async def _dev_work(agent_id: str, directive: str, *, asker: str, project: str) -> None:
+    """A developer does REAL coding: the LLM emits a multi-file project, each file
+    is written to disk under the project workspace AND published as an artifact so
+    the dashboard shows the file tree."""
     await get_bus().publish("agent.status", {"agent": agent_id, "status": "working"})
     area = DEV_AGENTS[agent_id]
     system = (
         get_card(agent_id).system_prompt
-        + f"\n\nYou write real, working {area} code. When assigned work, START CODING "
-        "now. Respond with: a one-sentence note on what you built, then EXACTLY one "
-        "fenced code block whose info string is the language and a file path, e.g. "
-        "```python app/main.py. Keep the file focused and runnable (~20-60 lines)."
+        + f"\n\nYou are a real {area} engineer. When assigned work, BUILD A REAL "
+        "PROJECT now — multiple complete, runnable files with a sensible folder "
+        "structure. Respond with: a one-sentence note, then 2-5 fenced code blocks. "
+        "Each block's info string MUST be the language and the full file path, e.g.\n"
+        "```python backend/app/main.py\n...code...\n```\n"
+        "Give complete file contents (not snippets). Use real directories in the paths."
     )
     history = await _history()
     user = (
         f"Team conversation so far:\n{_thread_text(history)}\n\n"
-        f"{_name(asker)} assigned you: \"{directive}\"\nWrite the {area} code now."
+        f"{_name(asker)} assigned you: \"{directive}\"\n"
+        f"Build the {area} part of the project now as real files."
     )
     res = await get_router().generate(
         agent_id, [LLMMessage(role="user", content=user)],
-        system=system, max_tokens=1100, temperature=0.4,
+        system=system, max_tokens=2200, temperature=0.4,
     )
-    note, language, filename, code = _extract_code(res.text, agent_id)
+    note, files = _extract_files(res.text, agent_id)
 
-    # Conversational summary in the chat...
     await _post(agent_id, note, to=asker,
                 provider=res.provider, fallback_used=res.fallback_used)
-    # ...and the actual code as a visible artifact.
-    if code:
+
+    for language, path, code in files:
+        disk_path = write_file(project, path, code)
         await get_bus().publish("artifact", {
             "agent": agent_id, "name": _name(agent_id), "area": area,
-            "filename": filename, "language": language, "code": code,
-            "note": note, "provider": res.provider,
+            "project": project, "filename": path, "language": language,
+            "code": code, "note": note, "provider": res.provider,
+            "written": bool(disk_path),
         })
 
 
-def _extract_code(text: str, agent_id: str) -> tuple[str, str, str, str]:
-    """Pull (note, language, filename, code) from an LLM reply with a fenced block."""
+_EXT = {"python": "py", "typescript": "ts", "javascript": "js", "tsx": "tsx",
+        "jsx": "jsx", "json": "json", "yaml": "yml", "yml": "yml",
+        "dockerfile": "Dockerfile", "bash": "sh", "sh": "sh", "html": "html",
+        "css": "css", "sql": "sql", "markdown": "md", "text": "txt"}
+
+
+def _extract_files(text: str, agent_id: str) -> tuple[str, list[tuple[str, str, str]]]:
+    """Pull (note, [(language, path, content), ...]) from fenced code blocks."""
     import re
 
-    m = re.search(r"```([^\n`]*)\n(.*?)```", text, re.DOTALL)
-    if not m:
-        return (text.strip()[:300] or "Working on it.", "text", "", "")
-    info = m.group(1).strip().split()
-    language = info[0] if info else "text"
-    filename = next((tok for tok in info[1:] if "." in tok or "/" in tok), "")
-    if not filename:
-        ext = {"python": "py", "typescript": "ts", "javascript": "js",
-               "tsx": "tsx", "yaml": "yml", "dockerfile": "Dockerfile"}.get(language, "txt")
-        filename = f"{agent_id}_{DEV_AGENTS.get(agent_id, 'file')}.{ext}".replace("/", "_")
-    code = m.group(2).strip()
-    note = text[: m.start()].strip() or f"Implemented {filename}."
-    return note, language, filename, code
+    blocks = re.findall(r"```([^\n`]*)\n(.*?)```", text, re.DOTALL)
+    files: list[tuple[str, str, str]] = []
+    for i, (info, code) in enumerate(blocks):
+        parts = info.strip().split()
+        language = parts[0] if parts else "text"
+        path = next((t for t in parts[1:] if "." in t or "/" in t), "")
+        if not path:
+            ext = _EXT.get(language.lower(), "txt")
+            path = f"{DEV_AGENTS.get(agent_id, 'src')}/file{i + 1}.{ext}"
+        files.append((language, path.strip(), code.strip()))
+
+    first = text.index("```") if "```" in text else len(text)
+    note = text[:first].strip() or (
+        f"Built {len(files)} file(s)." if files else "Working on it."
+    )
+    return note, files
 
 
 async def _plan(manager_id: str, directive: str, reports: list[str]) -> dict:
@@ -285,12 +300,12 @@ def parse_mention(text: str) -> tuple[str | None, str]:
 
 
 async def _delegate(agent_id: str, directive: str, *, asker: str,
-                    involved: set[str], depth: int) -> None:
+                    involved: set[str], depth: int, project: str) -> None:
     """Recursively walk the hierarchy: managers delegate, leaves do the work."""
     involved.add(agent_id)
     reports = HIERARCHY.get(agent_id)
     if not reports or depth >= MAX_DEPTH:
-        await _reply(agent_id, directive, asker=asker)
+        await _reply(agent_id, directive, asker=asker, project=project)
         return
 
     plan = await _plan(agent_id, directive, reports)
@@ -300,7 +315,7 @@ async def _delegate(agent_id: str, directive: str, *, asker: str,
         rid = ask["agent"]
         await _post(agent_id, ask["question"], to=rid)
         await _delegate(rid, ask["question"], asker=agent_id,
-                        involved=involved, depth=depth + 1)
+                        involved=involved, depth=depth + 1, project=project)
 
 
 async def run_order(text: str, to: str | None = None) -> dict:
@@ -318,8 +333,10 @@ async def run_order(text: str, to: str | None = None) -> dict:
         # No one tagged — Maryam is addressing the room; nothing to cascade.
         return {"involved": []}
 
+    project = new_project(order)
     try:
-        await _delegate(target, order, asker="maryam", involved=involved, depth=1)
+        await _delegate(target, order, asker="maryam", involved=involved,
+                        depth=1, project=project)
         outcomes = [Outcome(agent=a, success=True) for a in involved if a != "hamza"]
         if outcomes:
             await appraise(outcomes)
@@ -331,7 +348,7 @@ async def run_order(text: str, to: str | None = None) -> dict:
             "working LLM key (GROQ_API_KEY / ANTHROPIC_API_KEY) and retry.",
             to="maryam",
         )
-    return {"involved": sorted(involved)}
+    return {"involved": sorted(involved), "project": project}
 
 
 async def get_thread(limit: int = 60) -> list[dict]:

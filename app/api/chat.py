@@ -30,4 +30,4 @@ async def thread(limit: int = 60) -> dict:
 async def give_order(body: OrderBody) -> dict:
     result = await run_order(body.text, body.to)
     return {"accepted": True, "involved": result.get("involved", []),
-            "messages": await get_thread(60)}
+            "project": result.get("project"), "messages": await get_thread(60)}

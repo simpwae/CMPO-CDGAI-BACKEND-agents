@@ -58,6 +58,13 @@ async def learning(limit: int = 50) -> dict:
 
 
 @router.get("/artifacts")
-async def artifacts(limit: int = 30) -> dict:
+async def artifacts(limit: int = 60) -> dict:
     repo = await get_repo()
     return {"artifacts": await repo.find("artifacts", limit=limit)}
+
+
+@router.get("/workspace")
+async def workspace(project: str) -> dict:
+    from app.lib.workspace import list_tree
+
+    return {"project": project, "files": list_tree(project)}
