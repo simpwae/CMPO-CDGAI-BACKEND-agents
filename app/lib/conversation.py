@@ -98,11 +98,12 @@ DEV_AGENTS = {
 }
 
 
-async def _reply(agent_id: str, directive: str, *, asker: str, project: str) -> None:
+async def _reply(agent_id: str, directive: str, *, asker: str, project: str,
+                 metrics: dict) -> None:
     """A leaf agent does the work. Developers actually write a multi-file project
     to disk; everyone else replies in prose."""
     if agent_id in DEV_AGENTS:
-        await _dev_work(agent_id, directive, asker=asker, project=project)
+        await _dev_work(agent_id, directive, asker=asker, project=project, metrics=metrics)
         return
 
     await get_bus().publish("agent.status", {"agent": agent_id, "status": "working"})
@@ -116,11 +117,15 @@ async def _reply(agent_id: str, directive: str, *, asker: str, project: str) -> 
         agent_id, [LLMMessage(role="user", content=user)],
         system=get_card(agent_id).system_prompt, max_tokens=350,
     )
-    await _post(agent_id, res.text, to=asker,
+    text = res.text or ""
+    await _post(agent_id, text, to=asker,
                 provider=res.provider, fallback_used=res.fallback_used)
+    metrics[agent_id] = {"produced": bool(text.strip()), "chars": len(text.strip()),
+                         "fallback": res.fallback_used}
 
 
-async def _dev_work(agent_id: str, directive: str, *, asker: str, project: str) -> None:
+async def _dev_work(agent_id: str, directive: str, *, asker: str, project: str,
+                    metrics: dict) -> None:
     """A developer does REAL coding: the LLM emits a multi-file project, each file
     is written to disk under the project workspace AND published as an artifact so
     the dashboard shows the file tree."""
@@ -158,6 +163,8 @@ async def _dev_work(agent_id: str, directive: str, *, asker: str, project: str) 
             "code": code, "note": note, "provider": res.provider,
             "written": bool(disk_path),
         })
+    metrics[agent_id] = {"produced": bool(files), "chars": len(note),
+                         "files": len(files), "fallback": res.fallback_used}
 
 
 _EXT = {"python": "py", "typescript": "ts", "javascript": "js", "tsx": "tsx",
@@ -300,22 +307,26 @@ def parse_mention(text: str) -> tuple[str | None, str]:
 
 
 async def _delegate(agent_id: str, directive: str, *, asker: str,
-                    involved: set[str], depth: int, project: str) -> None:
+                    involved: set[str], depth: int, project: str,
+                    metrics: dict) -> None:
     """Recursively walk the hierarchy: managers delegate, leaves do the work."""
     involved.add(agent_id)
     reports = HIERARCHY.get(agent_id)
     if not reports or depth >= MAX_DEPTH:
-        await _reply(agent_id, directive, asker=asker, project=project)
+        await _reply(agent_id, directive, asker=asker, project=project, metrics=metrics)
         return
 
     plan = await _plan(agent_id, directive, reports)
     await _post(agent_id, plan["summary"], to=asker,
                 provider=plan["_provider"], fallback_used=plan["_fallback"])
+    metrics[agent_id] = {"produced": bool(plan["summary"].strip()),
+                         "chars": len(plan["summary"]),
+                         "delegated": len(plan["asks"]), "fallback": plan["_fallback"]}
     for ask in plan["asks"]:
         rid = ask["agent"]
         await _post(agent_id, ask["question"], to=rid)
-        await _delegate(rid, ask["question"], asker=agent_id,
-                        involved=involved, depth=depth + 1, project=project)
+        await _delegate(rid, ask["question"], asker=agent_id, involved=involved,
+                        depth=depth + 1, project=project, metrics=metrics)
 
 
 async def run_order(text: str, to: str | None = None) -> dict:
@@ -334,10 +345,14 @@ async def run_order(text: str, to: str | None = None) -> dict:
         return {"involved": []}
 
     project = new_project(order)
+    metrics: dict[str, dict] = {}
     try:
         await _delegate(target, order, asker="maryam", involved=involved,
-                        depth=1, project=project)
-        outcomes = [Outcome(agent=a, success=True) for a in involved if a != "hamza"]
+                        depth=1, project=project, metrics=metrics)
+        outcomes = [
+            Outcome(agent=a, **metrics.get(a, {"produced": True}))
+            for a in involved if a != "hamza"
+        ]
         if outcomes:
             await appraise(outcomes)
     except Exception as e:  # noqa: BLE001
