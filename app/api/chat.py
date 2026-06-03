@@ -1,8 +1,5 @@
-"""Chat/objective surface.
-
-The operator assigns an objective; Maryam then drives the team conversation.
-The operator is NOT a chat participant — Maryam asks the questions.
-"""
+"""Chat surface. The human IS Maryam (the primary user): she gives orders and
+tags a teammate with @name. The tagged teammate's branch then cascades."""
 from __future__ import annotations
 
 import asyncio
@@ -10,14 +7,14 @@ import asyncio
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from app.lib.conversation import get_thread, run_objective
+from app.lib.conversation import get_thread, run_order
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 
-class ObjectiveBody(BaseModel):
-    text: str          # the objective to hand to Maryam
-    sender: str = "operator"
+class OrderBody(BaseModel):
+    text: str               # Maryam's order, may contain an @mention
+    to: str | None = None   # optional explicit recipient (overrides @mention)
 
 
 @router.get("")
@@ -26,7 +23,7 @@ async def thread(limit: int = 60) -> dict:
 
 
 @router.post("")
-async def assign_objective(body: ObjectiveBody) -> dict:
-    # Maryam orchestrates in the background; the team conversation streams via SSE.
-    asyncio.create_task(run_objective(body.text))
+async def give_order(body: OrderBody) -> dict:
+    # Cascade runs in the background; the team conversation streams via SSE.
+    asyncio.create_task(run_order(body.text, body.to))
     return {"accepted": True}

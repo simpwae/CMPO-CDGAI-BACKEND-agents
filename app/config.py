@@ -12,6 +12,13 @@ class Settings(BaseSettings):
     # LLM keys
     anthropic_api_key: str = ""
     gemini_api_key: str = ""
+    grok_api_key: str = ""
+    groq_api_key: str = ""
+
+    # Fallback order (comma-separated provider names). Providers whose key is
+    # unset raise immediately and are skipped. Default puts the working free
+    # Groq tier first; reorder (e.g. "claude,gemini,grok,groq") when you have keys.
+    llm_order: str = "groq,claude,gemini,grok"
 
     # Orchestration
     maryam_mode: str = "assist"  # "assist" | "auto"
@@ -28,6 +35,10 @@ class Settings(BaseSettings):
     claude_model_default: str = "claude-sonnet-4-6"   # everyone else
     gemini_model_lead: str = "gemini-2.5-pro"
     gemini_model_default: str = "gemini-2.5-flash"
+    grok_model_lead: str = "grok-4"
+    grok_model_default: str = "grok-3"
+    groq_model_lead: str = "llama-3.3-70b-versatile"
+    groq_model_default: str = "llama-3.1-8b-instant"
 
 
 @lru_cache

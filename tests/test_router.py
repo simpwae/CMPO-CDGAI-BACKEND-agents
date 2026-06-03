@@ -58,6 +58,36 @@ async def test_falls_back_to_gemini_when_claude_fails():
     assert any("forced failure" in e for e in res.error_chain)
 
 
+class FakeGrok(LLMProvider):
+    name = "grok"
+
+    def __init__(self):
+        self.calls = 0
+
+    async def generate(self, model, messages, **kwargs) -> LLMResult:
+        self.calls += 1
+        return LLMResult(text="from-grok", provider="grok", model=model)
+
+
+@pytest.mark.asyncio
+async def test_falls_through_to_grok_when_claude_and_gemini_fail():
+    claude = FakeClaude(fail=True)
+
+    class DeadGemini(LLMProvider):
+        name = "gemini"
+
+        async def generate(self, model, messages, **kwargs):
+            raise ProviderError("gemini", "down")
+
+    grok = FakeGrok()
+    router = ModelRouter(anthropic=claude, gemini=DeadGemini(), grok=grok)
+    res = await router.generate("tariq", MSGS)
+    assert res.provider == "grok"
+    assert res.fallback_used is True
+    assert grok.calls == 1
+    assert any("forced failure" in e for e in res.error_chain)
+
+
 @pytest.mark.asyncio
 async def test_lead_agent_uses_lead_model():
     claude, gemini = FakeClaude(fail=False), FakeGemini()

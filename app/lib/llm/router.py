@@ -1,14 +1,14 @@
 """Model router — the single choke point for ALL agent reasoning.
 
-Order of operations for every call:
-  1. Resolve the agent's tier (lead agents get the stronger model).
-  2. Call Anthropic (Claude). On any failure, retry once.
-  3. If Claude still fails, transparently fall back to Gemini.
-  4. Return a normalized LLMResult carrying `provider` + `fallback_used`
-     so the dashboard can show which model served each step.
+For every call the router walks an ordered provider chain (configurable via
+`LLM_ORDER`). The first provider gets a retry; the rest get one attempt each.
+A provider whose key is unset raises immediately and is skipped. The first
+success returns a normalized LLMResult carrying `provider` + `fallback_used`
+so the dashboard shows which model served each step.
 
-No agent code may import a provider SDK directly — everything goes through
-`generate(...)`.
+Default order puts the working free Groq tier first; set `LLM_ORDER` to
+"claude,gemini,grok,groq" once an Anthropic key is available. No agent code may
+import a provider SDK directly — everything goes through `generate(...)`.
 """
 from __future__ import annotations
 
@@ -18,13 +18,17 @@ from app.config import get_settings
 from app.lib.llm.providers.anthropic_provider import AnthropicProvider
 from app.lib.llm.providers.base import LLMProvider
 from app.lib.llm.providers.gemini_provider import GeminiProvider
+from app.lib.llm.providers.grok_provider import GrokProvider
+from app.lib.llm.providers.groq_provider import GroqProvider
 from app.lib.llm.types import LLMMessage, LLMResult, ProviderError
 
 # Agents that reason on the stronger ("lead") model tier.
 LEAD_AGENTS = {"maryam", "naqash"}
 
+DEFAULT_ORDER = ["claude", "gemini", "grok", "groq"]
+
 # Optional observer invoked after every call so the AG-UI activity feed can
-# surface which provider served each step. Set via set_call_observer().
+# surface which provider served each step.
 CallObserver = Callable[[dict], Awaitable[None] | None]
 
 
@@ -33,22 +37,34 @@ class ModelRouter:
         self,
         anthropic: LLMProvider | None = None,
         gemini: LLMProvider | None = None,
+        grok: LLMProvider | None = None,
+        groq: LLMProvider | None = None,
         observer: CallObserver | None = None,
+        order: list[str] | None = None,
     ):
         s = get_settings()
-        self._anthropic = anthropic or AnthropicProvider(s.anthropic_api_key)
-        self._gemini = gemini or GeminiProvider(s.gemini_api_key)
+        self._providers: dict[str, LLMProvider] = {
+            "claude": anthropic or AnthropicProvider(s.anthropic_api_key),
+            "gemini": gemini or GeminiProvider(s.gemini_api_key),
+            "grok": grok or GrokProvider(s.grok_api_key),
+            "groq": groq or GroqProvider(s.groq_api_key),
+        }
+        self._order = order or DEFAULT_ORDER
         self._observer = observer
         self._s = s
 
     def set_observer(self, observer: CallObserver) -> None:
         self._observer = observer
 
-    def _models_for(self, agent: str) -> tuple[str, str]:
-        """Return (claude_model, gemini_model) for the agent's tier."""
-        if agent.lower() in LEAD_AGENTS:
-            return self._s.claude_model_lead, self._s.gemini_model_lead
-        return self._s.claude_model_default, self._s.gemini_model_default
+    def _model_for(self, provider: str, agent: str) -> str:
+        lead = agent.lower() in LEAD_AGENTS
+        models = {
+            "claude": (self._s.claude_model_lead, self._s.claude_model_default),
+            "gemini": (self._s.gemini_model_lead, self._s.gemini_model_default),
+            "grok": (self._s.grok_model_lead, self._s.grok_model_default),
+            "groq": (self._s.groq_model_lead, self._s.groq_model_default),
+        }[provider]
+        return models[0] if lead else models[1]
 
     async def generate(
         self,
@@ -59,41 +75,32 @@ class ModelRouter:
         max_tokens: int = 1024,
         temperature: float = 0.7,
     ) -> LLMResult:
-        claude_model, gemini_model = self._models_for(agent)
         errors: list[str] = []
 
-        # --- Primary: Claude, with one retry ---
-        for attempt in range(2):
-            try:
-                result = await self._anthropic.generate(
-                    claude_model,
-                    messages,
-                    system=system,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                )
-                result.error_chain = errors
-                await self._emit(agent, result)
-                return result
-            except Exception as e:  # noqa: BLE001
-                errors.append(f"claude attempt {attempt + 1}: {e}")
+        for idx, name in enumerate(self._order):
+            provider = self._providers.get(name)
+            if provider is None:
+                continue
+            # The primary provider gets one retry; fallbacks get a single shot.
+            attempts = 2 if idx == 0 else 1
+            for attempt in range(attempts):
+                try:
+                    result = await provider.generate(
+                        self._model_for(name, agent),
+                        messages,
+                        system=system,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                    )
+                    result.fallback_used = idx > 0
+                    result.error_chain = errors
+                    await self._emit(agent, result)
+                    return result
+                except Exception as e:  # noqa: BLE001
+                    label = name if attempts == 1 else f"{name} attempt {attempt + 1}"
+                    errors.append(f"{label}: {e}")
 
-        # --- Fallback: Gemini ---
-        try:
-            result = await self._gemini.generate(
-                gemini_model,
-                messages,
-                system=system,
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
-            result.fallback_used = True
-            result.error_chain = errors
-            await self._emit(agent, result)
-            return result
-        except Exception as e:  # noqa: BLE001
-            errors.append(f"gemini: {e}")
-            raise ProviderError("router", " | ".join(errors)) from e
+        raise ProviderError("router", " | ".join(errors) or "no providers configured")
 
     async def _emit(self, agent: str, result: LLMResult) -> None:
         if not self._observer:
@@ -110,7 +117,7 @@ _router: ModelRouter | None = None
 def get_router() -> ModelRouter:
     global _router
     if _router is None:
-        _router = ModelRouter()
+        _router = ModelRouter(order=get_settings().llm_order.split(","))
     return _router
 
 

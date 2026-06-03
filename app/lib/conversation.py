@@ -1,20 +1,17 @@
-"""Maryam-driven team orchestration (real LLM).
+"""Hierarchical, cascading team orchestration (real LLM).
 
-The interaction is inverted: the operator does NOT chat with Maryam. The operator
-assigns an *objective*, and Maryam runs the room — she asks her teammates real
-questions, they answer with real LLM calls, and leads delegate downward. Every
-message records who is speaking and who they are speaking TO, so the dashboard
-shows exactly who can talk to whom (matching the org edges in §3).
+The operator assigns an objective. Maryam does NOT get a scripted plan — she
+(real LLM) decides which of her direct reports to tag and what to ask each.
+Each tagged report then makes ITS OWN decision the same way, cascading down the
+org chart until the work reaches the specialist who does it:
 
-Communication structure follows the authoritative graph:
-  Maryam -> Tariq / Momin / Zain / Hamza
-  Momin  -> Naqash
-  Naqash -> Fateh Shah / Shams / Usman      (build)
-  Naqash <-> Ihsan                          (test/fix loop, no Momin)
-Hamza appraises everyone involved and reports to Maryam.
+    Maryam → Momin → Naqash → Shams (backend) / Fateh (frontend) / Usman (devops)
+                                     ↘ Ihsan (test)
 
-Message CONTENT is real LLM output; the delegation STRUCTURE is fixed by the org
-chart, so an assignment to Naqash always makes Naqash actually do the work.
+So tagging Momin with build work makes Momin autonomously route to Naqash, who
+assigns the right engineer — no hard-coded path, every hop is a real decision.
+Every message is directed (sender + `to`) and persisted, so the dashboard shows
+exactly who talked to whom. Managers reason on the lead model tier.
 """
 from __future__ import annotations
 
@@ -27,14 +24,23 @@ from app.lib.events import get_bus
 from app.lib.llm.router import get_router
 from app.lib.llm.types import LLMMessage
 
-# Whom Maryam may directly ask (her A2A peers).
-MARYAM_PEERS = ["tariq", "momin", "zain", "hamza"]
-NAQASH_SUBS = ["fateh", "shams", "usman"]
+# Org chart: manager -> direct reports (everyone else is a leaf who does the work).
+HIERARCHY: dict[str, list[str]] = {
+    "maryam": ["tariq", "momin", "zain", "hamza"],
+    "momin": ["naqash"],
+    "naqash": ["fateh", "shams", "usman", "ihsan"],
+}
+MAX_DEPTH = 4
+MAX_ASKS = 3
 
 
 def _name(agent_id: str) -> str:
     c = ROSTER.get(agent_id)
     return c.name if c else agent_id.title()
+
+
+def _reports_blurb(reports: list[str]) -> str:
+    return "\n".join(f"- {r} ({_name(r)} — {get_card(r).role})" for r in reports)
 
 
 async def _history(limit: int = 60) -> list[dict]:
@@ -45,24 +51,23 @@ async def _history(limit: int = 60) -> list[dict]:
 def _thread_text(history: list[dict]) -> str:
     if not history:
         return "(conversation just started)"
-    lines = []
+    out = []
     for m in history:
         to = f" → {m['to_name']}" if m.get("to_name") else ""
-        lines.append(f"{m.get('name', m['sender'])}{to}: {m['text']}")
-    return "\n".join(lines)
+        out.append(f"{m.get('name', m['sender'])}{to}: {m['text']}")
+    return "\n".join(out)
 
 
 async def _post(sender: str, text: str, *, to: str | None = None,
                 provider: str | None = None, fallback_used: bool = False,
                 name: str | None = None) -> dict:
-    """Persist + stream one directed message (sender speaking TO `to`)."""
     repo = await get_repo()
     doc = {
         "thread": "main",
         "sender": sender,
         "name": name or _name(sender),
         "to": to,
-        "to_name": _name(to) if to else None,
+        "to_name": _name(to) if to and to in ROSTER else (to.title() if to else None),
         "text": text,
         "provider": provider,
         "fallback_used": fallback_used,
@@ -73,138 +78,172 @@ async def _post(sender: str, text: str, *, to: str | None = None,
     if sender in ROSTER:
         await bus.publish("agent.status", {"agent": sender, "status": "idle"})
     if to and to in ROSTER:
-        # Mirror the directed edge onto the activity feed / graph.
         await bus.publish(
             "a2a.message", {"from": sender, "to": to, "text": text, "state": "completed"}
         )
     return doc
 
 
-async def _reply(agent_id: str, prompt: str, *, asker: str) -> dict:
-    """Get a real LLM reply from an agent and post it (agent -> asker)."""
+async def _reply(agent_id: str, directive: str, *, asker: str) -> None:
+    """A leaf agent does the actual work — real LLM reply posted back to the asker."""
     await get_bus().publish("agent.status", {"agent": agent_id, "status": "working"})
     history = await _history()
-    system = get_card(agent_id).system_prompt
     user = (
         f"Team conversation so far:\n{_thread_text(history)}\n\n"
-        f"{_name(asker)} asks you: \"{prompt}\"\n"
-        "Reply in 1-3 sentences, as yourself, actually doing your part."
+        f"{_name(asker)} assigned you: \"{directive}\"\n"
+        "Reply in 1-3 sentences as yourself, actually doing your part of the work."
     )
     res = await get_router().generate(
-        agent_id, [LLMMessage(role="user", content=user)], system=system, max_tokens=350
+        agent_id, [LLMMessage(role="user", content=user)],
+        system=get_card(agent_id).system_prompt, max_tokens=350,
     )
-    return await _post(agent_id, res.text, to=asker,
-                       provider=res.provider, fallback_used=res.fallback_used)
+    await _post(agent_id, res.text, to=asker,
+                provider=res.provider, fallback_used=res.fallback_used)
 
 
-async def _maryam_plan(objective: str) -> dict:
-    """Maryam decides whom to ask and what to ask them. Returns parsed plan."""
-    await get_bus().publish("agent.status", {"agent": "maryam", "status": "working"})
+async def _plan(manager_id: str, directive: str, reports: list[str]) -> dict:
+    """A manager decides which reports to tag and what to ask each (real LLM)."""
+    await get_bus().publish("agent.status", {"agent": manager_id, "status": "working"})
     history = await _history()
     system = (
-        get_card("maryam").system_prompt
-        + "\n\nYour directly-reachable team: "
-        + ", ".join(f"{a} ({_name(a)})" for a in MARYAM_PEERS)
-        + ". For any build/development work delegate to Momin, who assigns Naqash "
-        "(the dev lead); Naqash then directs Fateh/Shams/Usman and tests with Ihsan. "
-        "Use Tariq for research, Zain for events/outreach, Hamza for appraisal.\n\n"
-        "Respond ONLY as JSON: "
-        '{"summary": "<1 sentence to the team>", '
-        '"asks": [{"agent": "<peer_id>", "question": "<what you ask them>"}], '
-        '"needs_dev": <true|false>}. '
-        "Only use agent ids from your reachable team. Keep questions to one sentence."
+        get_card(manager_id).system_prompt
+        + "\n\nYour direct reports:\n" + _reports_blurb(reports)
+        + "\n\nRoute the task to the report(s) whose role fits, using this mapping: "
+        "research → Tariq; building/developing/implementing software, an API, app "
+        "or feature → Momin (he manages the dev team); events/hackathons/outreach/"
+        "LinkedIn/email → Zain; performance review → Hamza; general development → "
+        "Naqash; backend → Shams; frontend → Fateh; devops/deploy → Usman; "
+        "testing/QA → Ihsan. Respond ONLY as JSON: "
+        '{"summary": "<1 sentence acknowledging the task>", '
+        '"asks": [{"agent": "<report_id>", "question": "<what you assign them>"}]}. '
+        "Use only ids from your direct reports. Keep each question to one sentence."
     )
-    user = f"Objective from the operator: \"{objective}\"\nPlan who you will ask."
+    user = (
+        f"Conversation so far:\n{_thread_text(history)}\n\n"
+        f"You were asked: \"{directive}\"\nDecide who to delegate to."
+    )
     res = await get_router().generate(
-        "maryam", [LLMMessage(role="user", content=user)], system=system, max_tokens=500
+        manager_id, [LLMMessage(role="user", content=user)],
+        system=system, max_tokens=450, temperature=0.3,
     )
-    return {**_parse_plan(res.text), "_provider": res.provider, "_fallback": res.fallback_used}
+    parsed = _parse_plan(res.text, reports)
+    _ensure_dev_routing(manager_id, directive, parsed, reports)
+    parsed["_provider"] = res.provider
+    parsed["_fallback"] = res.fallback_used
+    return parsed
 
 
-def _parse_plan(text: str) -> dict:
+def _parse_plan(text: str, reports: list[str]) -> dict:
     try:
         data = json.loads(text[text.index("{"): text.rindex("}") + 1])
         asks = [
-            {"agent": a["agent"], "question": str(a.get("question", "")).strip()}
+            {"agent": a["agent"], "question": str(a.get("question", "")).strip()
+             or "Please handle this."}
             for a in data.get("asks", [])
-            if a.get("agent") in MARYAM_PEERS
-        ]
-        return {
-            "summary": str(data.get("summary", "")).strip() or "Let's get to work, team.",
-            "asks": asks or [{"agent": "tariq", "question": "Please look into this."}],
-            "needs_dev": bool(data.get("needs_dev", False)),
-        }
+            if a.get("agent") in reports
+        ][:MAX_ASKS]
+        summary = str(data.get("summary", "")).strip() or "On it — delegating now."
+        if not asks:  # fall back to the first report so work still flows
+            asks = [{"agent": reports[0], "question": "Please take this on."}]
+        return {"summary": summary, "asks": asks}
     except Exception:
         return {
-            "summary": text.strip()[:200] or "Let's get to work, team.",
-            "asks": [{"agent": "tariq", "question": "Please look into this objective."}],
-            "needs_dev": False,
+            "summary": text.strip()[:200] or "On it — delegating now.",
+            "asks": [{"agent": reports[0], "question": "Please take this on."}],
         }
 
 
-async def _naqash_builds(objective: str) -> list[str]:
-    """Naqash directs his sub-team and runs the test/fix loop with Ihsan."""
-    involved = ["naqash"]
-    # Naqash kicks off (real reply to Momin's hand-off).
-    await _reply("naqash", f"Lead the build for: {objective}", asker="momin")
-
-    for sub, area in [("fateh", "frontend"), ("shams", "backend"), ("usman", "devops")]:
-        q = f"Take the {area} for: {objective}. What will you do?"
-        await _post("naqash", q, to=sub)
-        await _reply(sub, q, asker="naqash")
-        involved.append(sub)
-
-    # Naqash <-> Ihsan direct test/fix loop (no Momin).
-    q1 = "The build is ready — please test it and report any issues."
-    await _post("naqash", q1, to="ihsan")
-    await _reply("ihsan", q1, asker="naqash")
-    q2 = "Thanks. I've addressed what you found — please re-test and confirm."
-    await _post("naqash", q2, to="ihsan")
-    await _reply("ihsan", q2, asker="naqash")
-    involved.append("ihsan")
-    return involved
+_DEV_KW = ("build", "develop", "implement", "api", "backend", "frontend",
+           "code", "app", "feature", "deploy", "devops", "test")
 
 
-async def run_objective(objective: str) -> dict:
-    """Operator assigns an objective; Maryam interrogates and drives the team."""
-    await _post("operator", objective, to="maryam", name="Objective")
+def _ensure_dev_routing(manager_id: str, directive: str, parsed: dict,
+                        reports: list[str]) -> None:
+    """Safety net so build orders always reach the dev team (the cascade the
+    user expects): Momin -> Naqash, and Naqash -> the right specialist."""
+    d = directive.lower()
+    if not any(k in d for k in _DEV_KW):
+        return
+    have = {a["agent"] for a in parsed["asks"]}
+    if "naqash" in reports and "naqash" not in have:
+        parsed["asks"].insert(
+            0, {"agent": "naqash", "question": f"Please lead development for: {directive}"}
+        )
+    if manager_id == "naqash":
+        pick = ("shams" if ("backend" in d or "api" in d)
+                else "fateh" if "frontend" in d
+                else "usman" if ("deploy" in d or "devops" in d)
+                else "shams")
+        if pick in reports and pick not in have:
+            parsed["asks"].insert(0, {"agent": pick, "question": f"Please handle: {directive}"})
 
-    involved: list[str] = []
+
+def parse_mention(text: str) -> tuple[str | None, str]:
+    """Pull a leading/embedded @mention and resolve it to an agent id.
+
+    "@momin build the API" -> ("momin", "build the API"). Matches agent ids and
+    first names case-insensitively.
+    """
+    import re
+
+    by_first = {c.name.split()[0].lower(): aid for aid, c in ROSTER.items()}
+    for m in re.finditer(r"@([A-Za-z]+)", text):
+        token = m.group(1).lower()
+        target = token if token in ROSTER else by_first.get(token)
+        if target:
+            cleaned = (text[: m.start()] + text[m.end():]).strip()
+            return target, cleaned or text
+    return None, text
+
+
+async def _delegate(agent_id: str, directive: str, *, asker: str,
+                    involved: set[str], depth: int) -> None:
+    """Recursively walk the hierarchy: managers delegate, leaves do the work."""
+    involved.add(agent_id)
+    reports = HIERARCHY.get(agent_id)
+    if not reports or depth >= MAX_DEPTH:
+        await _reply(agent_id, directive, asker=asker)
+        return
+
+    plan = await _plan(agent_id, directive, reports)
+    await _post(agent_id, plan["summary"], to=asker,
+                provider=plan["_provider"], fallback_used=plan["_fallback"])
+    for ask in plan["asks"]:
+        rid = ask["agent"]
+        await _post(agent_id, ask["question"], to=rid)
+        await _delegate(rid, ask["question"], asker=agent_id,
+                        involved=involved, depth=depth + 1)
+
+
+async def run_order(text: str, to: str | None = None) -> dict:
+    """The human IS Maryam: she gives an order and tags a teammate (@name).
+
+    Maryam's message is posted as herself, then the tagged teammate's branch
+    cascades autonomously (managers delegate down, the specialist does the work).
+    """
+    target, order = (to, text) if to else parse_mention(text)
+    # Maryam (the primary user) speaks.
+    await _post("maryam", order, to=target, name="Maryam")
+
+    involved: set[str] = set()
+    if not target or target not in ROSTER:
+        # No one tagged — Maryam is addressing the room; nothing to cascade.
+        return {"involved": []}
+
     try:
-        plan = await _maryam_plan(objective)
-        await _post("maryam", plan["summary"],
-                    provider=plan["_provider"], fallback_used=plan["_fallback"])
-
-        for ask in plan["asks"]:
-            agent_id = ask["agent"]
-            await _post("maryam", ask["question"], to=agent_id)
-            await _reply(agent_id, ask["question"], asker="maryam")
-            involved.append(agent_id)
-
-            # A build/dev objective cascades down the dev org through Momin->Naqash.
-            if agent_id == "momin" and plan["needs_dev"]:
-                handoff = f"Assign this build to Naqash: {objective}"
-                await _post("momin", handoff, to="naqash")
-                involved += await _naqash_builds(objective)
-
-        # Hamza appraises everyone involved and reports to Maryam.
-        seen, outcomes = set(), []
-        for a in involved:
-            if a not in seen and a != "hamza":
-                seen.add(a)
-                outcomes.append(Outcome(agent=a, success=True))
+        await _delegate(target, order, asker="maryam", involved=involved, depth=1)
+        outcomes = [Outcome(agent=a, success=True) for a in involved if a != "hamza"]
         if outcomes:
             await appraise(outcomes)
-    except Exception as e:  # noqa: BLE001 — most often: no/blocked LLM key
-        await get_bus().publish("agent.status", {"agent": "maryam", "status": "error"})
+    except Exception as e:  # noqa: BLE001
+        await get_bus().publish("agent.status", {"agent": target, "status": "error"})
         await _post(
-            "maryam",
+            target,
             f"⚠️ I couldn't reach a language model ({type(e).__name__}). Configure a "
-            "working ANTHROPIC_API_KEY or GEMINI_API_KEY on the backend, then reassign "
-            "the objective.",
+            "working LLM key (GROQ_API_KEY / ANTHROPIC_API_KEY) and retry.",
+            to="maryam",
         )
-
-    return {"involved": involved}
+    return {"involved": sorted(involved)}
 
 
 async def get_thread(limit: int = 60) -> list[dict]:

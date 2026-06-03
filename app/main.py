@@ -47,8 +47,10 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
+    # Wildcard origins (any frontend / Vercel preview) is valid only with
+    # credentials disabled — the frontend uses no cookies, so this is fine.
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
