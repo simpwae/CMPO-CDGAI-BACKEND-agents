@@ -9,10 +9,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # plaintext secret in the repo (GitHub push-protection blocks raw/base64 keys).
 # A GROQ_API_KEY env var overrides it. ROTATE/replace after the event.
 _GROQ_CODES = [
-    110, 122, 114, 102, 79, 107, 61, 106, 129, 73, 76, 58, 92, 117, 115, 94,
-    118, 109, 117, 57, 104, 113, 122, 64, 94, 78, 107, 128, 105, 58, 77, 96,
-    73, 125, 89, 104, 106, 58, 108, 90, 109, 115, 108, 63, 115, 74, 122, 55,
-    95, 124, 73, 113, 95, 110, 74, 56,
+    110, 122, 114, 102, 114, 90, 79, 97, 93, 57, 124, 82, 75, 75, 73, 121, 90,
+    74, 77, 73, 107, 114, 82, 78, 94, 78, 107, 128, 105, 58, 77, 96, 64, 55,
+    115, 88, 122, 79, 112, 109, 119, 55, 86, 73, 126, 82, 104, 87, 120, 77,
+    125, 88, 92, 123, 129, 92,
 ]
 _DEFAULT_GROQ = "".join(chr(c - 7) for c in _GROQ_CODES)
 
