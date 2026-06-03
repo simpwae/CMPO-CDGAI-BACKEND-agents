@@ -196,7 +196,7 @@ async def _plan(manager_id: str, directive: str, reports: list[str]) -> dict:
     )
     res = await get_router().generate(
         manager_id, [LLMMessage(role="user", content=user)],
-        system=system, max_tokens=700, temperature=0.3,
+        system=system, max_tokens=400, temperature=0.3,
     )
     parsed = _parse_plan(res.text, reports)
     _ensure_dev_routing(manager_id, directive, parsed, reports)

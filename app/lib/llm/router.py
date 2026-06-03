@@ -22,8 +22,11 @@ from app.lib.llm.providers.grok_provider import GrokProvider
 from app.lib.llm.providers.groq_provider import GroqProvider
 from app.lib.llm.types import LLMMessage, LLMResult, ProviderError
 
-# Agents that reason on the stronger ("lead") model tier.
+# Agents that reason/work on the stronger model tier. Leads orchestrate; the
+# developer agents need the stronger model so their generated code is solid.
 LEAD_AGENTS = {"maryam", "naqash"}
+CODE_AGENTS = {"fateh", "shams", "usman", "ihsan"}
+STRONG_TIER = LEAD_AGENTS | CODE_AGENTS
 
 DEFAULT_ORDER = ["claude", "gemini", "grok", "groq"]
 
@@ -57,7 +60,7 @@ class ModelRouter:
         self._observer = observer
 
     def _model_for(self, provider: str, agent: str) -> str:
-        lead = agent.lower() in LEAD_AGENTS
+        lead = agent.lower() in STRONG_TIER
         models = {
             "claude": (self._s.claude_model_lead, self._s.claude_model_default),
             "gemini": (self._s.gemini_model_lead, self._s.gemini_model_default),
