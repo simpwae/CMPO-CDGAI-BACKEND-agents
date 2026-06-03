@@ -45,7 +45,11 @@ def _reports_blurb(reports: list[str]) -> str:
 
 async def _history(limit: int = 60) -> list[dict]:
     repo = await get_repo()
-    return await repo.find("messages", {"thread": "main"}, limit=limit, sort_desc=False)
+    # Fetch the most recent `limit` messages, then return them in chronological
+    # order (oldest -> newest). Sorting ascending would return the OLDEST messages
+    # once the thread grows past `limit`, hiding new replies.
+    rows = await repo.find("messages", {"thread": "main"}, limit=limit, sort_desc=True)
+    return list(reversed(rows))
 
 
 def _thread_text(history: list[dict]) -> str:
